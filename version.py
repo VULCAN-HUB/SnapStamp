@@ -1,0 +1,5 @@
+APP_NAME = "SnapStamp"
+VERSION = "0.1.0"
+RELEASE_LABEL = "BETA Ver-0.1"
+AUTHOR = "Unknown"
+YEAR = 2026

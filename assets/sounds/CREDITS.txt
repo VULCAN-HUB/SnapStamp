@@ -1,0 +1,11 @@
+SnapStamp 효과음 출처
+=====================
+
+- beep.wav, done.wav : 자체 합성(tools/make_sounds.py)
+
+- shutter.wav : 실제 녹음 음원
+    제목  : Camera shutter hard click
+    출처  : Mixkit (https://mixkit.co/free-sound-effects/camera/)
+    라이선스: Mixkit Free License (상업 이용 가능, 저작자 표시 불필요)
+    가공  : 끝부분 컷 + 페이드아웃, 모노 44.1kHz 16bit 정규화
+    ※ 이 파일은 tools/make_sounds.py 로 덮어쓰지 않는다(합성음 아님).
