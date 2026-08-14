@@ -1,7 +1,7 @@
 from PyQt5.QtCore import (Qt, pyqtSignal, QTimer, QPropertyAnimation, QEasingCurve,
-                          QRectF, QEvent)
-from PyQt5.QtGui import (QKeySequence, QPixmap, QPainter, QColor, QPen, QFont)
-from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QApplication,
+                          QRectF)
+from PyQt5.QtGui import QPixmap, QPainter, QColor, QPen, QFont
+from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                              QSizePolicy, QPushButton, QGraphicsOpacityEffect)
 from ui.theme import ACCENT, TEXT, MUTED, INK, SURFACE
 
@@ -85,13 +85,35 @@ class ShootWindow(QWidget):
             self.cut_cells.append(c); tl.addWidget(c)
         root.addWidget(top)
 
-        # ── 중앙 라이브뷰 ──
+        # ── 중앙: 준비 단계엔 좌=고른 디자인 / 우=라이브뷰, 촬영 시작하면 라이브뷰가 전부 ──
+        split = QHBoxLayout(); split.setContentsMargins(0, 0, 0, 0); split.setSpacing(0)
+        root.addLayout(split, 1)
+        self.design = QWidget()
+        self.design.setStyleSheet("background:#0A0D12; border-right:1px solid #222831;")
+        dv = QVBoxLayout(self.design); dv.setContentsMargins(20, 16, 20, 16); dv.setSpacing(10)
+        self.design_name = QLabel("디자인")
+        self.design_name.setAlignment(Qt.AlignCenter)
+        self.design_name.setStyleSheet(f"color:{TEXT}; font-size:26px; font-weight:bold;")
+        dv.addWidget(self.design_name)
+        self.design_prev = QLabel()
+        self.design_prev.setAlignment(Qt.AlignCenter)
+        self.design_prev.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+        self.design_prev.setMinimumSize(1, 1)
+        dv.addWidget(self.design_prev, 1)
+        self.design_tip = QLabel("◀ ▶ 로 디자인 고르기")
+        self.design_tip.setAlignment(Qt.AlignCenter)
+        self.design_tip.setStyleSheet("color:#FFD98A; font-size:20px; font-weight:bold;")
+        dv.addWidget(self.design_tip)
+        self.design.hide()
+        self._design_pm = None
+        split.addWidget(self.design, 4)
+
         self.view = QLabel(); self.view.setAlignment(Qt.AlignCenter)
         self.view.setText("카메라 연결 대기 중…")
         self.view.setStyleSheet(f"color:{MUTED}; font-size:28px; background:#000000;")
         self.view.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
         self.view.setMinimumSize(1, 1)
-        root.addWidget(self.view, 1)
+        split.addWidget(self.view, 6)
 
         # ── 하단 안내 바 ── 어떤 모니터 비율에서도 일정하고 넉넉한 높이(비율 무관 고정)
         self.hint = QLabel("버튼을 눌러 촬영을 시작하세요")
@@ -141,30 +163,24 @@ class ShootWindow(QWidget):
         self._busy_timer.timeout.connect(self._spin)
         self._spin_n = 0
 
-        # ⚠️ QShortcut(WindowShortcut)은 이 구조(QStackedWidget+전체화면)에서 트리거가
-        #    전달되지 않는 사례가 실측으로 확인됐다(손님이 촬영을 시작 못 함).
-        #    설정 화면과 동일하게 '앱 전역 이벤트 필터'로 처리해 포커스와 무관하게 항상 받는다.
-        self.trigger_key = controller.config.get("trigger_key", "Space")
-        QApplication.instance().installEventFilter(self)
-
-    def eventFilter(self, obj, ev):
-        # 촬영 화면이 보일 때만, 트리거 키를 받아 다음 단계로(준비→카운트다운, 컷→다음 컷)
-        if ev.type() == QEvent.KeyPress and self.isVisible() and not ev.isAutoRepeat():
-            name = QKeySequence(ev.key()).toString()
-            if name and name == QKeySequence(self.trigger_key).toString():
-                self.controller.on_trigger()
-                return True
-        return super().eventFilter(obj, ev)
+        # ⚠️ 트리거 키는 이 위젯이 직접 받지 않는다 — QShortcut(WindowShortcut)도,
+        #    창 포커스도 이 구조(QStackedWidget 전체화면 + 보조 모니터 창)에서는 못 받는다.
+        #    main.py 의 앱 전역 키 라우터가 현재 화면을 보고 controller.on_trigger() 를 부른다.
 
     def resizeEvent(self, e):
+        self._place_design()
         self.countdown.setGeometry(self.rect())
         self.flash_ov.setGeometry(self.rect())
         self.busy.setGeometry(self.rect())
         super().resizeEvent(e)
 
     def on_frame(self, qimage):
+        # ⚠️ 라이브뷰는 매 프레임 스케일된다. 1080p에 SmoothTransformation을 쓰면 비용이 커
+        #    카운트다운·플래시 때 끊김이 생긴다. 움직이는 영상은 Fast로 충분.
+        if not self.isVisible():
+            return
         pm = QPixmap.fromImage(qimage)
-        self.view.setPixmap(pm.scaled(self.view.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        self.view.setPixmap(pm.scaled(self.view.size(), Qt.KeepAspectRatio, Qt.FastTransformation))
 
     def set_shot_count(self, n: int):
         self.shot_count = n
@@ -182,7 +198,7 @@ class ShootWindow(QWidget):
             pm = QPixmap(path)
             if not pm.isNull():
                 cell.setPixmap(pm.scaled(cell.size(), Qt.KeepAspectRatioByExpanding,
-                                         Qt.SmoothTransformation))
+                                         Qt.FastTransformation))
             cell.setStyleSheet(CELL_FULL)
 
     def show_countdown(self, num: int):
@@ -191,7 +207,8 @@ class ShootWindow(QWidget):
         self.countdown.set_number(num)
         self.countdown.setGeometry(self.rect())
         self.countdown.show(); self.countdown.raise_()
-        self._cd_anim.stop(); self._cd_anim.start()  # 숫자마다 팝 애니메이션
+        # ⚠️ 여기서 QGraphicsOpacityEffect 페이드를 돌리면 전체화면 오버레이가 매 프레임
+        #    오프스크린 재합성되어 카운트다운이 끊긴다. 즉시 표시가 더 또렷하고 가볍다.
 
     def flash(self):
         """셔터 플래시: 흰 화면 잠깐."""
@@ -214,6 +231,30 @@ class ShootWindow(QWidget):
         self._spin_n = (self._spin_n + 1) % 4
         self.busy_dots.setText("●" * (self._spin_n + 1))
 
+    def set_design(self, name: str, pixmap=None, choosable: bool = True):
+        """준비 단계에 고른 디자인을 좌측에 보여준다(운영자도 무엇이 선택됐는지 봐야 한다)."""
+        # ⚠️ 등록 레이아웃이 하나뿐이어도 **디자인은 보여준다** — 손님이 무엇으로 찍히는지
+        #    알아야 한다. 숨기는 건 '고르기 안내'뿐(고를 게 없는데 ◀▶ 를 띄우면 거짓말).
+        if not name:
+            self.design.hide(); return
+        self.design_tip.setVisible(bool(choosable))
+        self.design_name.setText(name)
+        if pixmap is not None and not pixmap.isNull():
+            self._design_pm = pixmap
+        self.design.show()
+        self._place_design()
+
+    def hide_design(self):
+        self.design.hide()
+
+    def _place_design(self):
+        pm = self._design_pm
+        if pm is None or pm.isNull() or not self.design.isVisible():
+            return
+        box = self.design_prev.size()
+        if box.width() > 2 and box.height() > 2:
+            self.design_prev.setPixmap(pm.scaled(box, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
     def set_hint(self, text: str):
         self.hint.setText(text)
 
@@ -225,5 +266,3 @@ class ShootWindow(QWidget):
         else:
             self.warn.hide()
 
-    def rebind_trigger(self, key):
-        self.trigger_key = key or "Space"

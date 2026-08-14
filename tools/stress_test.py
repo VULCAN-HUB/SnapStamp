@@ -220,7 +220,7 @@ def main():
     print(f"\n  종료 후 스레드 : {threading.active_count()}  핸들 {handles()}")
     shutil.rmtree(save, ignore_errors=True)
     ok = not fails and alive == 3 and alive_all and len(stems) == len(urls)
-    print("\n판정:", "정상 — 연속 사용 가능" if ok else "문제 발견(위 실패 항목 확인)")
+    print("\n판정:", "정상 - 연속 사용 가능" if ok else "문제 발견(위 실패 항목 확인)")
 
 
 if __name__ == "__main__":

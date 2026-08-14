@@ -67,7 +67,7 @@ class ResultWindow(QWidget):
         self.qr_title.setAlignment(Qt.AlignCenter)
         self.qr_title.setStyleSheet(f"color:{TEXT}; font-size:24px; font-weight:bold;")
         right.addWidget(self.qr_title)
-        self.qr_card = QWidget(); self.qr_card.setFixedSize(300, 300)
+        self.qr_card = QWidget(); self.qr_card.setFixedSize(160, 160)   # 실제 크기는 화면 높이에 맞춰 다시 정한다
         self.qr_card.setStyleSheet("background:white; border-radius:20px;")
         shadow(self.qr_card, blur=40, dy=12, alpha=130)
         ql = QVBoxLayout(self.qr_card); ql.setContentsMargins(18, 18, 18, 18)
@@ -126,6 +126,10 @@ class ResultWindow(QWidget):
         #    처음부터 자리를 잡아두고 '제작 중'을 보여준 뒤, 준비되면 QR만 바꿔 끼운다.
         n_cards = (1 if show_wifi else 0) + 1
         side = 210 if n_cards == 2 else 270
+        # ⚠️ QR 카드를 고정 크기로 두면 세로가 짧은 모니터(720p 등)에서 화면을 넘긴다.
+        #    쓸 수 있는 높이에 맞춰 줄인다 — 스캔에는 140px 면 충분하다.
+        avail = self.height() if self.height() > 200 else 720
+        side = max(140, min(side, (avail - 260) // n_cards - 40))
         card = side + 40
         self.wifi_title.setVisible(show_wifi)
         self.wifi_card.setVisible(show_wifi)
@@ -267,18 +271,19 @@ class ResultWindow(QWidget):
         self.trigger_key = key or "Space"
         self.tip.setText(f"‘{self.trigger_key}’ 키를 빠르게 두 번 눌러도 됩니다")
 
-    def keyPressEvent(self, e):
-        name = QKeySequence(e.key()).toString()
-        if name and name == QKeySequence(self.trigger_key).toString() and not e.isAutoRepeat():
-            now = time.monotonic()
-            if self._last_space and (now - self._last_space) < 0.45:
-                self._last_space = 0.0
-                self._stop_reveal()          # 연출 중이면 중단하고 즉시 다음 손님으로
-                self.home_requested.emit()  # 트리거 키 짧게 연속 두 번 → 처음 촬영으로
-            else:
-                self._last_space = now
-            return
-        super().keyPressEvent(e)
+    def trigger_pressed(self):
+        """트리거 키 1회 입력(앱 전역 라우터가 호출). 빠르게 두 번이면 다음 손님으로.
+
+        ⚠️ keyPressEvent 로 받으면 안 된다 — 보조 모니터(손님) 창이 활성 창을 가져가면
+        이 위젯에는 키가 오지 않는다. 라우터가 포커스와 무관하게 넘겨준다.
+        """
+        now = time.monotonic()
+        if self._last_space and (now - self._last_space) < 0.45:
+            self._last_space = 0.0
+            self._stop_reveal()          # 연출 중이면 중단하고 즉시 다음 손님으로
+            self.home_requested.emit()  # 트리거 키 짧게 연속 두 번 → 처음 촬영으로
+        else:
+            self._last_space = now
 
     def attach_server(self, server):
         self._server = server

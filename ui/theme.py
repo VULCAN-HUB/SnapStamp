@@ -7,7 +7,7 @@ from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QFontDatabase, QPixmap, QColor, QFont
 from PyQt5.QtWidgets import (QWidget, QLabel, QDialog, QHBoxLayout, QVBoxLayout,
                              QPushButton, QGraphicsDropShadowEffect, QSpinBox, QComboBox,
-                             QSlider)
+                             QSlider, QSizePolicy)
 import version
 from core.platform_utils import platform_label
 
@@ -157,6 +157,7 @@ def make_header(parent) -> QWidget:
     credit = QLabel("PROJECT 04  ·  UNKNOWN")
     credit.setStyleSheet(f"color:{MUTED}; font-size:14px;")
     letter_spacing(credit, 1.2)
+    credit.setMinimumWidth(1)      # 좁은 화면에서 이 부가 표기만 줄어들게(브랜드는 유지)
     lay.addWidget(credit)
     from ui import icons
     btn = QPushButton(); btn.setFixedSize(34, 34)

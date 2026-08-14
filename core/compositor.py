@@ -144,5 +144,7 @@ def compose(template_path, slots, photos, out_path, canvas_size=None, quality=97
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
     # 최종 JPEG 저장: 품질은 설정값(기본 97). 최고 품질일 때 크로마 서브샘플링 없음(4:4:4).
-    canvas.convert("RGB").save(out, quality=int(quality), subsampling=0 if quality >= 96 else 2)
+    # dpi=300 → 100×148mm 캔버스가 실제 엽서 크기로 인쇄된다.
+    canvas.convert("RGB").save(out, quality=int(quality),
+                               subsampling=0 if quality >= 96 else 2, dpi=(300, 300))
     return out

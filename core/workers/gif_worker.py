@@ -8,7 +8,8 @@ class GifWorker(QThread):
     gif_failed = pyqtSignal(str)
 
     def __init__(self, clips, slots, canvas_size, out_base, bg_color="#FFFFFF",
-                 tone=None, adjust=None, brand=None, fmt="GIF", max_w=720, fps=12):
+                 tone=None, adjust=None, brand=None, fmt="GIF", max_w=720, fps=12,
+                 template_path=None):
         super().__init__()
         self.clips = clips
         self.slots = slots
@@ -21,12 +22,14 @@ class GifWorker(QThread):
         self.fmt = (fmt or "GIF").upper()
         self.max_w = max_w
         self.fps = fps
+        self.template_path = template_path
 
     def run(self):
         try:
             frames = build_frames(self.clips, self.slots, self.canvas_size,
                                   bg_color=self.bg_color, tone=self.tone,
-                                  adjust=self.adjust, brand=self.brand, max_w=self.max_w)
+                                  adjust=self.adjust, brand=self.brand, max_w=self.max_w,
+                                  template_path=self.template_path)
             if not frames:
                 self.gif_failed.emit("클립 없음")
                 return

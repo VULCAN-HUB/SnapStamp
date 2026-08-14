@@ -4,7 +4,7 @@
 "트리거로 시작" CTA. 트리거 키/클릭으로 촬영 시작, 우상단 톱니로 운영자 설정 복귀.
 """
 from PyQt5.QtCore import Qt, pyqtSignal, QPropertyAnimation, QEasingCurve, QSize
-from PyQt5.QtGui import QPixmap, QKeySequence
+from PyQt5.QtGui import QPixmap
 from PyQt5.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QLabel, QPushButton,
                              QSizePolicy, QGraphicsOpacityEffect)
 from ui.theme import (INK, SURFACE, LINE, ACCENT, ACCENT_HI, TEXT, MUTED, GOLD,
@@ -13,8 +13,7 @@ from ui import icons
 
 
 class AttractWindow(QWidget):
-    start_requested = pyqtSignal()
-    setup_requested = pyqtSignal()
+    setup_requested = pyqtSignal()   # 톱니 버튼 → 운영자 설정(트리거·Esc 는 main.py 라우터)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -44,11 +43,38 @@ class AttractWindow(QWidget):
         letter_spacing(eyebrow, 5.0)  # QSS는 자간 무시 → QFont로
         lv.addWidget(eyebrow)
         lv.addSpacing(14)
-        hero = QLabel("다시 없을 이 순간,\n<span style='color:#8B94A7;'>네 컷.</span>")
-        hero.setTextFormat(Qt.RichText)
-        hero.setStyleSheet("color:#EEF1F7; font-size:66px; font-weight:800; line-height:105%;")
-        lv.addWidget(hero)
+        self.hero = QLabel("다시 없을 이 순간,\n<span style='color:#8B94A7;'>네 컷.</span>")
+        self.hero.setTextFormat(Qt.RichText)
+        self.hero.setStyleSheet("color:#EEF1F7; font-size:66px; font-weight:800; line-height:105%;")
+        # ⚠️ 줄바꿈을 안 켜면 이 큰 글자의 폭이 창의 최소 폭이 되어 좁은 모니터에서 화면을 넘친다
+        self.hero.setWordWrap(True); self.hero.setMinimumWidth(1)
+        lv.addWidget(self.hero)
+
+        # ── 문구 자리에 '지금 고른 디자인' — 손님이 방향키로 고른다 ──
+        self.design = QWidget()
+        dv = QVBoxLayout(self.design); dv.setContentsMargins(0, 0, 0, 0); dv.setSpacing(10)
+        self.design_name = QLabel("디자인")
+        self.design_name.setStyleSheet(f"color:{TEXT}; font-size:30px; font-weight:800;")
+        self.design_name.setWordWrap(True); self.design_name.setMinimumWidth(1)
+        dv.addWidget(self.design_name)
+        self.design_prev = QLabel()
+        self.design_prev.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.design_prev.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+        self.design_prev.setMinimumSize(1, 1)
+        dv.addWidget(self.design_prev, 1)
+        self.design_tip = QLabel("◀ ▶ 방향키로 디자인을 골라주세요")
+        self.design_tip.setStyleSheet(f"color:{GOLD}; font-size:24px; font-weight:800;")
+        self.design_tip.setWordWrap(True); self.design_tip.setMinimumWidth(1)
+        dv.addWidget(self.design_tip)
+        self.design.hide()
+        self._design_pm = None
+        lv.addWidget(self.design, 1)
         lv.addStretch(1)
+        # 디자인이 뜨면 위아래 여백을 접고 그림에 자리를 몰아준다(작게 보이던 원인).
+        self._lv = lv
+        self._i_stretch_top = 1          # brand 다음의 addStretch
+        self._i_design = lv.indexOf(self.design)
+        self._i_stretch_bot = self._i_design + 1
         # CTA (은은하게 맥동)
         self.cta = QWidget()
         cl = QHBoxLayout(self.cta); cl.setContentsMargins(0, 0, 0, 0); cl.setSpacing(16)
@@ -64,6 +90,7 @@ class AttractWindow(QWidget):
         # 렌더링이 누락된다(Qt 제약). 알약 그림자는 생략하고 맥동만 사용.
         cta_txt = QLabel("를 눌러 시작하세요")
         cta_txt.setStyleSheet(f"color:{MUTED}; font-size:20px;")
+        cta_txt.setWordWrap(True); cta_txt.setMinimumWidth(1)
         cl.addWidget(self.key_pill); cl.addWidget(cta_txt); cl.addStretch(1)
         lv.addWidget(self.cta)
         h.addWidget(left, 58)
@@ -123,21 +150,48 @@ class AttractWindow(QWidget):
         label = "스페이스바" if self.trigger_key == "Space" else self.trigger_key
         self.key_pill.setText(label)
 
+    def set_design(self, name: str, pixmap=None, choosable: bool = True):
+        """문구 자리에 지금 고른 디자인을 보여준다. 여러 개 등록됐을 때만 고르기 안내."""
+        if not name:
+            self.design.hide(); self.hero.show()
+            self._lv.setStretch(self._i_stretch_top, 1)   # 원래 여백 복구
+            self._lv.setStretch(self._i_stretch_bot, 1)
+            return
+        self.hero.hide()                    # 브랜드 문구 자리를 디자인이 대신한다
+        self._lv.setStretch(self._i_stretch_top, 0)   # 위아래 여백 접기 → 그림이 커진다
+        self._lv.setStretch(self._i_stretch_bot, 0)
+        self._lv.setStretch(self._i_design, 1)
+        self.design_name.setText(name)
+        self.design_tip.setVisible(bool(choosable))
+        if pixmap is not None and not pixmap.isNull():
+            self._design_pm = pixmap
+        self.design.show()
+        self._place_design()
+
+    def _place_design(self):
+        pm = self._design_pm
+        if pm is None or pm.isNull() or not self.design.isVisible():
+            return
+        box = self.design_prev.size()
+        if box.width() > 2 and box.height() > 2:
+            self.design_prev.setPixmap(pm.scaled(box, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            self.design_prev.setAlignment(Qt.AlignCenter)
+
+    def resizeEvent(self, e):
+        self._place_design()
+        super().resizeEvent(e)
+
     def on_frame(self, qimage):
+        if not self.isVisible():
+            return                     # 안 보이는 화면에 매 프레임 스케일 낭비 금지
         pm = QPixmap.fromImage(qimage)
-        self.view.setPixmap(pm.scaled(self.view.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        self.view.setPixmap(pm.scaled(self.view.size(), Qt.KeepAspectRatio, Qt.FastTransformation))
         self.live.setStyleSheet(f"color:{ACCENT_HI}; font-size:16px; font-weight:700; letter-spacing:2px;")
 
     def mousePressEvent(self, e):
         # 클릭으로는 촬영을 시작하지 않는다(오탭 방지) — 오직 트리거 키로만 시작.
         super().mousePressEvent(e)
 
-    def keyPressEvent(self, e):
-        name = QKeySequence(e.key()).toString()
-        if name and name == QKeySequence(self.trigger_key).toString() and not e.isAutoRepeat():
-            self.start_requested.emit()
-            return
-        if e.key() == Qt.Key_Escape:
-            self.setup_requested.emit()  # 운영자: 설정으로 복귀
-            return
-        super().keyPressEvent(e)
+    # ⚠️ 트리거/Esc 키는 여기서 처리하지 않는다. 보조 모니터(손님) 창이 뜨면 그쪽이 활성 창이
+    #    되어 이 위젯은 키를 아예 못 받는다(실측: activeWindow=AudienceWindow). main.py 의
+    #    앱 전역 키 라우터가 포커스와 무관하게 받아 현재 화면으로 보낸다.

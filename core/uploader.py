@@ -23,37 +23,12 @@ def _is_private(ip: str) -> bool:
 def get_lan_ip() -> str:
     """손님 폰이 접속할 이 PC의 주소.
 
-    ⚠️ 인터넷이 없는 환경(모바일 핫스팟 단독 운영)에서는 기본 라우트 조회가 실패한다.
-    그때 127.0.0.1을 주면 손님이 절대 접속 못 하는 QR이 되므로, 로컬 인터페이스에서
-    사설 IP를 찾아 쓴다(윈도우 모바일 핫스팟은 192.168.137.1 을 사용).
+    ⚠️ **폰은 유선을 꽂을 수 없다.** 인터넷이 나가는 경로(기본 라우트)를 그대로 쓰면, 유선으로
+    인터넷을 쓰면서 핫스팟으로 손님을 받는 구성에서 손님이 절대 못 여는 QR 이 나간다.
+    판정은 [[core.net_addr]] 이 한다 — 핫스팟 > Wi-Fi > 유선 순.
     """
-    # 1) 기본 라우트 기반 — 인터넷/LAN이 있을 때 가장 정확
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        if ip and not ip.startswith("127."):
-            return ip
-    except OSError:
-        pass
-    finally:
-        s.close()
-    # 2) 오프라인 대비 — 이 PC에 붙은 IPv4 중 사설 주소 선택
-    cands = []
-    try:
-        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
-            ip = info[4][0]
-            if ip and not ip.startswith("127.") and ip not in cands:
-                cands.append(ip)
-    except OSError:
-        pass
-    for ip in cands:                      # 윈도우 모바일 핫스팟 대역 최우선
-        if ip.startswith("192.168.137."):
-            return ip
-    for ip in cands:
-        if _is_private(ip):
-            return ip
-    return cands[0] if cands else "127.0.0.1"
+    from core.net_addr import pick_guest_ip
+    return pick_guest_ip()[0]
 
 
 class _NoListHandler(SimpleHTTPRequestHandler):

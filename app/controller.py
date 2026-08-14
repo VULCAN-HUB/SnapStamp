@@ -14,6 +14,23 @@ from core.qr_gen import make_qr
 LIVEVIEW_INTERVAL_MS = 66  # ~15fps(리더 fps와 맞춰 UI 부하 절감 — 1080p 프레임 변환 비용↑)
 
 
+def _shrink(im, target_w: int):
+    """긴 변을 target_w 로 줄인 축소본. **매 프레임 도는 코드라 싸야 한다.**
+
+    ⚠️ `resize()` 하나로 줄이면 1440×1080→480 이 15ms(기본 BICUBIC) 걸린다 — 폴링 간격
+    66ms의 4분의 1을 메인 스레드에서 태우는 셈이라 키 입력·화면 전환까지 굼떠진다.
+    정수배 `reduce()`(박스 평균)로 먼저 줄이고 나머지만 BILINEAR 로 맞추면 1.9ms(실측 8배).
+    박스 평균이라 LANCZOS 링잉 함정도 없다.
+    """
+    from PIL import Image
+    w, h = im.size
+    th = max(1, int(round(h * target_w / max(1, w))))
+    k = max(1, min(w // target_w, h // th))
+    if k > 1:
+        im = im.reduce(k)
+    return im if im.size == (target_w, th) else im.resize((target_w, th), Image.BILINEAR)
+
+
 class AppController(QObject):
     state_changed = pyqtSignal(object)
     frame_ready = pyqtSignal(QImage)
@@ -32,6 +49,7 @@ class AppController(QObject):
         import tempfile
         self.work_dir = str(Path(tempfile.gettempdir()) / "snapstamp_work")
         Path(self.work_dir).mkdir(parents=True, exist_ok=True)
+        self._purge_work_dir()
         self.backend = get_backend(config, self.work_dir)
         self._session_base = None    # 이번 세션 파일 이름(사진·움짤 공통)
         self.max_shots = 4
@@ -51,6 +69,25 @@ class AppController(QObject):
         self._clip_buf = deque(maxlen=18)   # 약 1.2초(15fps 기준)
         self._clips = []                    # 컷별 클립
         self.gif_worker = None
+
+    def _purge_work_dir(self, max_age_h: int = 24):
+        """작업 폴더의 **오래된 찌꺼기**만 지운다(컷 원본·QR 이미지).
+
+        ⚠️ 정상 종료 때는 컷이 정리되지만, 중간에 세션이 끊기거나 앱이 강제 종료되면 남는다.
+        실측: 5일 쓰고 124개·6.8MB 누적 — 부스를 계속 돌리면 계속 늘어난다.
+        **저장 폴더(손님 사진)는 절대 건드리지 않는다** — 여기서 지우는 건 임시 작업물뿐이다.
+        """
+        import time
+        cutoff = time.time() - max_age_h * 3600
+        try:
+            for f in Path(self.work_dir).iterdir():
+                try:
+                    if f.is_file() and f.stat().st_mtime < cutoff:
+                        f.unlink()
+                except Exception:  # noqa: BLE001 — 사용 중인 파일은 건너뛴다
+                    pass
+        except Exception:  # noqa: BLE001
+            pass
 
     def shutdown(self):
         # QObject.__del__은 PyQt에서 안전하지 않으므로(GC 시점에 C++ 객체 소멸 가능,
@@ -164,6 +201,19 @@ class AppController(QObject):
         if not self._live_timer.isActive():
             self._live_timer.start()
 
+    def _shot_ratio(self, idx: int = None) -> float:
+        """**그 컷이 들어갈 칸**의 가로/세로. 칸마다 비율이 다른 레이아웃이 있으므로
+        '첫 칸 비율' 하나로 고정하면 안 된다(그러면 합성 때 cover_fit 이 더 잘라 비율이 깨진다).
+
+        idx 를 안 주면 지금 찍을 차례의 칸(= 이미 찍은 장수)을 쓴다.
+        """
+        from core.aspect import slots_ratio
+        slots = self.config.get("slots") or []
+        i = len(self.photos) if idx is None else idx
+        if 0 <= i < len(slots):
+            return slots_ratio([slots[i]])
+        return slots_ratio(slots)
+
     def _pump_frame(self):
         try:
             frame = self.backend.get_frame()
@@ -171,9 +221,14 @@ class AppController(QObject):
             self.error_occurred.emit(str(e))
             return
         if frame is not None:
+            try:   # 현재 레이아웃 슬롯 비율로 크롭 — 라이브뷰 = 받는 사진(WYSIWYG, 잘림 없음)
+                from core.aspect import crop_to_ratio
+                frame = crop_to_ratio(frame, self._shot_ratio())
+            except Exception:  # noqa: BLE001
+                pass
             if self.config.get("gif_enabled", True):
-                try:   # 움짤용 롤링 버퍼(축소본 — 메모리 부담 최소)
-                    self._clip_buf.append(frame.convert("RGB").resize((480, 270)))
+                try:   # 움짤용 롤링 버퍼(축소본 — 비율 유지, 메모리 부담 최소)
+                    self._clip_buf.append(_shrink(frame, 480))
                 except Exception:  # noqa: BLE001
                     pass
             tone = self.config.get("tone")
@@ -209,6 +264,14 @@ class AppController(QObject):
             self.error_occurred.emit(f"촬영 실패: {e}")
             self._set(AppState.IDLE)
             return
+        try:
+            # ⚠️ 촬영본은 **이 컷이 들어갈 칸의 비율**로 한 번만 자른다. '대표(첫 칸) 비율'로
+            #    고정하면 칸마다 비율이 다른 레이아웃에서 합성 때 cover_fit 이 또 잘라
+            #    비율이 깨졌다. 같은 비율로 맞춰 두면 cover_fit 은 크기만 맞춘다(추가 잘림 0).
+            from core.aspect import crop_file_to_ratio
+            crop_file_to_ratio(str(path), self._shot_ratio(len(self.photos)))
+        except Exception:  # noqa: BLE001
+            pass
         if self.config.get("mirror_preview", False):
             self._mirror_file(path)  # 미리보기(거울)와 결과가 일치하도록 촬영본도 좌우 반전
         if self.config.get("gif_enabled", True):
@@ -303,7 +366,8 @@ class AppController(QObject):
                 },
                 fmt=self.config.get("gif_format", "GIF"),
                 max_w=int(self.config.get("gif_width", 720)),
-                fps=int(self.config.get("gif_fps", 12)))
+                fps=int(self.config.get("gif_fps", 12)),
+                template_path=self.config.get("template_path") or None)
             self.gif_worker.gif_done.connect(self._on_gif_done)
             self.gif_worker.gif_failed.connect(self.gif_failed.emit)  # 실패해도 사진 전달엔 영향 없음
             self.gif_worker.start()
@@ -357,7 +421,39 @@ class AppController(QObject):
             self._server = LocalServer(want, page_provider=self._render_share_page)
             self._server_base = self._server.start(int(self.config.get("share_port", 8765) or 0))
             self._server_dir = want
+        # ⚠️ 서버는 모든 인터페이스(0.0.0.0)에서 듣고 있으므로, 랜선을 꽂거나 핫스팟을 켜서
+        #    주소가 달라졌어도 서버를 다시 띄울 필요가 없다. **QR에 박을 주소만 매번 다시 고른다.**
+        #    (이미 나눠준 QR은 옛 주소라 못 살린다 — 그건 화면 경고로 알린다.)
+        from core.net_addr import pick_guest_ip
+        ip, kind = pick_guest_ip()
+        port = self._server_base.rsplit(":", 1)[-1].rstrip("/")
+        base = f"http://{ip}:{port}/"
+        if base != self._server_base:
+            self._server_base = base
+        self.guest_addr_kind = kind
         return self._server_base
+
+    def guest_endpoint(self):
+        """(주소, 종류) — 운영자 화면에 보여줄 '손님이 접속할 주소'. 서버가 아직이어도 계산된다."""
+        from core.net_addr import pick_guest_ip
+        ip, kind = pick_guest_ip()
+        port = int(self.config.get("share_port", 8765) or 8765)
+        return f"http://{ip}:{port}/", kind
+
+    def warmup_delivery(self):
+        """로컬 전달 서버를 앱 시작 때 미리 띄운다.
+
+        ⚠️ 목적은 성능이 아니라 **Windows 방화벽 허용 창이 뜨는 시점**이다. 서버를 첫 손님
+        완성 순간에 띄우면 그 대화상자가 손님 화면 위로 떠서 **키 입력을 통째로 가로챈다**
+        (실측: 트리거를 눌러도 아무 반응 없음 — Qt 모달이 아니라 OS 창이라 앱이 손쓸 수 없다).
+        운영자가 설정 화면을 보고 있을 때 뜨면 그 자리에서 '허용'을 누르고 시작할 수 있다.
+        """
+        if self.config.get("cloud_share_enabled", False):
+            return                      # 클라우드 전달이면 로컬 서버를 안 쓴다
+        try:
+            self._local_base()
+        except Exception:  # noqa: BLE001
+            pass                        # 서버가 못 떠도 앱은 계속 — 전달 시점에 다시 시도한다
 
     def _render_share_page(self, name: str):
         """손님이 QR로 접속했을 때 보는 브랜딩 페이지(사진+움짤 한 곳에서 받기)."""

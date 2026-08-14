@@ -19,8 +19,12 @@ def _scaled_slots(slots, f):
 
 
 def build_frames(clips, slots, canvas_size, bg_color="#FFFFFF", tone=None, adjust=None,
-                 brand=None, max_w=720):
-    """컷별 클립을 4칸 배치로 합쳐 애니메이션 프레임 목록(RGB)을 만든다."""
+                 brand=None, max_w=720, template_path=None):
+    """컷별 클립을 4칸 배치로 합쳐 애니메이션 프레임 목록(RGB)을 만든다.
+
+    template_path가 있으면 완성 사진과 똑같이 '템플릿(배경/프레임)'을 적용한다
+    (템플릿을 캔버스로 쓰고, 사진을 넣은 뒤, 프레임을 위에 다시 덮어 투명 구멍만 사진이 보이게).
+    """
     clips = [c for c in clips if c]
     if not clips:
         return []
@@ -28,21 +32,29 @@ def build_frames(clips, slots, canvas_size, bg_color="#FFFFFF", tone=None, adjus
     f = min(1.0, max_w / max(1, cw))
     sc = (max(1, int(cw * f)), max(1, int(ch * f)))
     sslots = _scaled_slots(slots, f)
+    # 템플릿을 GIF 해상도에 맞춰 한 번만 축소해 둔다(프레임마다 재로드/재축소 방지).
+    tmpl = None
+    if template_path:
+        try:
+            tmpl = Image.open(template_path).convert("RGBA").resize(sc, Image.LANCZOS)
+        except Exception:  # noqa: BLE001 — 템플릿 로드 실패 시 배경색으로 폴백
+            tmpl = None
     n = max(len(c) for c in clips)
-    # 컷별로 색감/보정을 미리 적용해 두면 프레임마다 반복 계산하지 않는다.
     prepared = []
     for clip in clips:
         prepared.append([apply_look(im.convert("RGB"), tone, adjust) if (tone or adjust)
                          else im.convert("RGB") for im in clip])
     out = []
     for k in range(n):
-        canvas = Image.new("RGBA", sc, bg_color or "#FFFFFF")
+        canvas = tmpl.copy() if tmpl is not None else Image.new("RGBA", sc, bg_color or "#FFFFFF")
         for slot, clip in zip(sslots, prepared):
             if not clip:
                 continue
             src = clip[min(k, len(clip) - 1)]
             canvas.paste(cover_fit(src.convert("RGBA"), slot["w"], slot["h"]),
                          (slot["x"], slot["y"]))
+        if tmpl is not None:
+            canvas.alpha_composite(tmpl)   # 프레임(투명 구멍) 위에 다시 덮기 = 완성 사진과 동일
         _draw_brand(canvas, brand)
         out.append(canvas.convert("RGB"))
     return out

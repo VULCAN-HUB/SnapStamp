@@ -1,5 +1,6 @@
+import os
 import time
-from PyQt5.QtCore import pyqtSignal, Qt, QEvent, QSize
+from PyQt5.QtCore import pyqtSignal, Qt, QEvent, QSize, QTimer
 from PyQt5.QtGui import QPixmap, QKeySequence
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
                              QSpinBox, QPushButton, QComboBox, QLineEdit, QFileDialog,
@@ -109,8 +110,16 @@ class SetupWindow(QWidget):
         self._build_settings_widgets()
         self.prefs = self._build_prefs_dialog()
 
-        body = QHBoxLayout(); body.setContentsMargins(28, 22, 28, 14); body.setSpacing(22)
-        root.addLayout(body, 1)
+        # ⚠️ 본문을 스크롤 영역에 담는다 — **창은 자기 최소 폭보다 작아질 수 없어서**, 내용이
+        #    화면보다 넓으면 전체화면이 옆 모니터까지 넘친다(실측: 최소 폭 2201px, 주 모니터 1536px).
+        #    스크롤에 담으면 어떤 해상도에서도 창이 화면 안에 들어오고, 모자라면 스크롤로 흡수한다.
+        body_host = QWidget(); body_host.setStyleSheet("background:transparent;")
+        body = QHBoxLayout(body_host); body.setContentsMargins(28, 22, 28, 14); body.setSpacing(22)
+        body_scroll = QScrollArea(); body_scroll.setWidgetResizable(True)
+        body_scroll.setFrameShape(QFrame.NoFrame)
+        body_scroll.setStyleSheet("QScrollArea{background:transparent;border:none;}")
+        body_scroll.setWidget(body_host)
+        root.addWidget(body_scroll, 1)
 
         # ══ 왼쪽: 라이브 미리보기(카메라 16:9에 딱 맞춤) + 구성 요약 ══
         LEFT_W = 460
@@ -154,7 +163,8 @@ class SetupWindow(QWidget):
                            ("brand", "문구·로고"), ("countdown", "카운트다운"),
                            ("cuts", "컷 수"), ("flash", "플래시"), ("sound", "효과음"),
                            ("mirror", "거울 모드"), ("delivery", "전달 방식"),
-                           ("wifi", "손님 WiFi 안내"), ("readyto", "준비화면 복귀"),
+                           ("wifi", "손님 WiFi 안내"), ("guestaddr", "손님 접속 주소"),
+                           ("readyto", "준비화면 복귀"),
                            ("abandonto", "촬영중 방치 취소"),
                            ("autoreturn", "완성 후 복귀"),
                            ("save", "저장 위치"), ("trigger", "트리거 키")):
@@ -187,31 +197,114 @@ class SetupWindow(QWidget):
         t2.setStyleSheet(f"color:{TEXT}; font-size:25px; font-weight:800;")
         tbox.addWidget(t2)
         sh.addLayout(tbox); sh.addStretch(1)
-        from core.layouts import LAYOUTS
+        # 레이아웃 라이브러리 = 예시(기본 제공) + 사용자가 추가한 자체 템플릿
+        self.user_layouts = [dict(u) for u in config.get("user_layouts", [])]
+
+        # 에디터 먼저 생성(버튼 콜백이 참조) — 초기 상태는 config 그대로 로드
+        cs = config.get("canvas_size", [800, 600])
+        self.editor = SlotEditor(config.get("slots", []), canvas_size=tuple(cs))
+        self.editor.changed.connect(self._on_slots_edited)
+        if config.get("template_path"):
+            self._apply_template(config["template_path"])
+        if config.get("even_layout"):
+            self.editor.set_even(True, normalize=False)
+
         sh.addWidget(_flabel("레이아웃"))
+        prev_b = QPushButton("◀"); prev_b.setFixedWidth(30); prev_b.setToolTip("이전 레이아웃")
+        prev_b.clicked.connect(lambda: self._step_layout(-1)); sh.addWidget(prev_b)
         self.layout_box = NoWheelComboBox()
-        self.layout_box.addItems(list(LAYOUTS.keys()))
-        self.layout_box.addItem("사용자 지정")   # 프리셋과 다르게 직접 편집한 배치
-        self.layout_box.currentTextChanged.connect(self._apply_layout)
+        self.layout_box.setMinimumWidth(150)
         sh.addWidget(self.layout_box)
-        ex_btn = QPushButton("  예시 내보내기")
+        next_b = QPushButton("▶"); next_b.setFixedWidth(30); next_b.setToolTip("다음 레이아웃")
+        next_b.clicked.connect(lambda: self._step_layout(1)); sh.addWidget(next_b)
+
+        # ⚠️ 여기서 줄을 바꾼다. 버튼을 한 줄에 다 넣으면 이 화면의 **최소 폭이 2201px** 이 되어
+        #    1536px 짜리 주 모니터에서 전체화면이 **옆 모니터까지 넘친다**(실측). 창은 최소 폭보다
+        #    작아질 수 없다 — 줄을 나눠 최소 폭을 낮추는 것이 근본 해결이다.
+        sv.addLayout(sh)
+        sh = QHBoxLayout(); sh.setSpacing(8)
+        sh.addStretch(1)
+
+        add_b = QPushButton("  이미지 추가")
+        add_b.setIcon(icons.icon("image", MUTED, 17)); add_b.setIconSize(QSize(17, 17))
+        add_b.setToolTip("자체 제작한 템플릿 이미지를 새 레이아웃으로 추가합니다")
+        add_b.clicked.connect(lambda: self._add_template_layout()); sh.addWidget(add_b)
+        self.rename_btn = QPushButton("이름")
+        self.rename_btn.setToolTip("레이아웃 이름 변경")
+        self.rename_btn.clicked.connect(self._rename_layout); sh.addWidget(self.rename_btn)
+        self.del_btn = QPushButton("삭제")
+        self.del_btn.clicked.connect(self._delete_layout); sh.addWidget(self.del_btn)
+
+        self.even_btn = QPushButton("  균등 OFF")
+        self.even_btn.setCheckable(True)
+        self.even_btn.setChecked(bool(config.get("even_layout")))
+        self.even_btn.setIconSize(QSize(17, 17))
+        self.even_btn.setToolTip("켜면 모든 칸이 하나의 격자처럼 묶여, 한 칸을 옮기면 전체가 함께 이동하고 "
+                                 "크기를 바꾸면 전체가 같은 크기로 조절됩니다")
+        self.even_btn.toggled.connect(self._toggle_even)
+        sh.addWidget(self.even_btn)
+        self._style_even_btn()
+
+        self.detect_btn = QPushButton()
+        self.detect_btn.setIcon(icons.icon("search", MUTED, 17))
+        self.detect_btn.setIconSize(QSize(17, 17))
+        self.detect_btn.setToolTip("템플릿 이미지의 사진 자리(투명 구멍·초록 칠)를 읽어 칸을 맞춥니다")
+        self.detect_btn.clicked.connect(self._detect_slots_now)
+        sh.addWidget(self.detect_btn)
+
+        ex_btn = QPushButton()
+        ex_btn.setToolTip("예시 템플릿 PNG 내보내기")
         ex_btn.setIcon(icons.icon("download", MUTED, 17)); ex_btn.setIconSize(QSize(17, 17))
         ex_btn.clicked.connect(self._export_examples)
         sh.addWidget(ex_btn)
         sv.addLayout(sh)
-        hint = QLabel("드래그로 이동 · 우하단 모서리로 크기조절")
+        hint = QLabel("드래그로 이동 · 우하단 모서리로 크기조절 · 칸 클릭 후 방향키로 미세이동(Shift=10px) · "
+                      "◀▶ 방향키로 내 레이아웃 전환(예시 제외)")
         hint.setStyleSheet(f"color:{MUTED}; font-size:15px;")
+        # ⚠️ 줄바꿈을 켜지 않으면 이 라벨의 '글자 폭'이 곧 화면의 최소 폭이 된다 —
+        #    창이 그보다 작아질 수 없어 전체화면이 **옆 모니터까지 넘친다**(실측 2201px).
+        hint.setWordWrap(True)
+        hint.setMinimumWidth(1)
         sv.addWidget(hint)
-        cs = config.get("canvas_size", [800, 600])
-        self.editor = SlotEditor(config.get("slots", []), canvas_size=tuple(cs))
-        if config.get("template_path"):
-            self._apply_template(config["template_path"])
-        # ⚠️ 콤보는 에디터보다 먼저 만들어지므로, 저장된 배치와 일치하는 프리셋 선택은
-        #    에디터가 생긴 '뒤'에 한다. blockSignals 없이 하면 _apply_layout이 돌아
-        #    저장된 슬롯을 프리셋으로 덮어써 버린다.
+
+        # 콤보 채우기 + 현재 config 상태에 맞는 항목 선택(시그널 차단으로 에디터 유지)
+        self._reload_layout_combo()
+        init_name = config.get("active_layout") or self._match_entry(
+            cs, config.get("slots", []), config.get("template_path", ""))
+        if not init_name and (config.get("template_path") or "").strip():
+            # 기존 설정의 자체 템플릿이 라이브러리에 없으면 사용자 레이아웃으로 등록
+            # (그래야 다른 레이아웃으로 갔다가 되돌아올 수 있고, 잃어버리지 않는다)
+            tp = config["template_path"].strip()
+            init_name = self._unique_layout_name(os.path.splitext(os.path.basename(tp))[0])
+            self.user_layouts.append({"name": init_name, "builtin": False, "template_path": tp,
+                                      "canvas_size": [self.editor.canvas_w, self.editor.canvas_h],
+                                      "slots": self.editor.get_slots(), "even": self.editor.even})
+            self._reload_layout_combo(select=init_name)
         self.layout_box.blockSignals(True)
-        self.layout_box.setCurrentText(self._match_layout(cs, config.get("slots", [])))
+        idx = self.layout_box.findData(init_name) if init_name else -1
+        if idx >= 0:
+            self.layout_box.setCurrentIndex(idx)
         self.layout_box.blockSignals(False)
+        # ⚠️ 위에서 시그널을 막고 인덱스를 넣었으므로 _select_layout 이 안 불린다.
+        #    활성 레이아웃 이름을 여기서 직접 세워야 편집이 엉뚱한 레이아웃에 저장되지 않는다.
+        # ⚠️ 매칭되는 항목이 없으면 **활성 이름을 비워 둔다.** 콤보 첫 항목(예시) 이름을 활성으로
+        #    저장해 버리면, 다음 실행에서 "이름과 배치 일치" 로직이 그 예시 배치로 **사용자 슬롯을
+        #    덮어쓴다**(구버전 설정으로 켠 뒤 재시작하면 배치가 통째로 바뀌는 실제 결함).
+        self._active_layout = init_name or ""
+        # ⚠️ 그리고 **이름과 배치가 어긋난 채로 시작하면 안 된다.** active_layout 은 아이돌형인데
+        #    저장된 slots/canvas 는 세로형인 설정으로 켜면, 화면엔 아이돌형이라 뜨고 사진은 옛 칸에
+        #    들어가 "비율이 깨진" 것처럼 보인다(실측). 이름이 가리키는 항목을 진짜로 적용한다.
+        # ⚠️ **설정이 이름을 명시했을 때만** 적용한다. 이름이 없어 콤보 첫 항목으로 떨어진 경우까지
+        #    적용하면, 저장돼 있던 사용자 슬롯을 엉뚱한 레이아웃 값으로 덮어써 버린다.
+        e0 = self._find_entry(init_name) if init_name else None
+        if e0 and (list(e0["canvas_size"]) != [self.editor.canvas_w, self.editor.canvas_h]
+                   or [dict(s) for s in e0["slots"]] != self.editor.get_slots()):
+            self._select_layout(init_name)
+        self._update_layout_buttons()
+        self.layout_box.currentIndexChanged.connect(
+            lambda _i: self._select_layout(self.layout_box.currentData()))
+
+        # 사진 칸 배치는 **관리자 화면에서 바로** 만진다(오너 지시 2026-08-12 — 설정 창에서 원복).
         sv.addWidget(self.editor, 1)
         body.addWidget(slot_card, 1)
 
@@ -226,7 +319,11 @@ class SetupWindow(QWidget):
         bl.addStretch(1)
         self.hint2 = QLabel("")
         self.hint2.setStyleSheet(f"color:{MUTED}; font-size:17px;")
-        bl.addWidget(self.hint2); bl.addSpacing(8)
+        # ⚠️ 줄바꿈만 켜면 좁은 칸에 갇혀 세로로 뭉친다 — 남는 가로 공간을 받도록 stretch 를 준다.
+        self.hint2.setWordWrap(True)
+        self.hint2.setMinimumWidth(1)
+        self.hint2.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        bl.addWidget(self.hint2, 1); bl.addSpacing(8)
         self.start_btn = QPushButton("  촬영 시작"); self.start_btn.setObjectName("primary")
         self.start_btn.setIcon(icons.icon("camera", "#FFFFFF", 20)); self.start_btn.setIconSize(QSize(20, 20))
         self.start_btn.setMinimumWidth(210); self.start_btn.setMinimumHeight(54)
@@ -260,10 +357,16 @@ class SetupWindow(QWidget):
         self.device_combo.addItem(cur_name if cur_name else "자동 감지 중…", cur_name)
         # 촬영 해상도
         self.res_box = NoWheelComboBox()
-        self._res_map = {"1920 × 1080 (최고)": (1920, 1080), "1280 × 720 (빠름)": (1280, 720)}
+        # 처리 해상도. 기본 FHD(약한 PC 권장). 4K는 고사양 PC용 — 4K 소스를 그대로 처리한다.
+        # (부스 출력엔 FHD면 충분하나, 좋은 기기로 넘어갈 때를 위해 상위 옵션을 남겨둠)
+        self._res_map = {"1920 × 1080 (FHD · 권장)": (1920, 1080), "1280 × 720 (빠름)": (1280, 720),
+                         "2560 × 1440 (QHD · 고사양)": (2560, 1440), "3840 × 2160 (4K · 고사양)": (3840, 2160)}
         self.res_box.addItems(list(self._res_map.keys()))
         cw = cfg.get("camera", {}).get("width", 1920)
-        self.res_box.setCurrentIndex(0 if cw >= 1920 else 1)
+        # 저장된 폭에 가장 가까운 항목 선택
+        keys = list(self._res_map.values())
+        best = min(range(len(keys)), key=lambda i: abs(keys[i][0] - cw))
+        self.res_box.setCurrentIndex(best)
         # 저장 화질(JPEG 품질)
         self.quality_box = NoWheelComboBox()
         self._q_map = {"최고 (선명·용량↑)": 97, "높음 (균형)": 92, "표준 (용량↓)": 88}
@@ -323,6 +426,11 @@ class SetupWindow(QWidget):
         self.wifi_pw.setPlaceholderText("WiFi 비밀번호(없으면 비움)")
         # 초기 인덱스 설정 뒤에 연결 → 시작 시 불필요한 자동감지 실행 방지
         self.wifi_mode_box.currentIndexChanged.connect(self._on_wifi_mode_changed)
+        # ⚠️ 장소가 바뀌면 WiFi 이름도 바뀐다. '현재 WiFi' 안내인데 지난 장소 이름이 그대로 남아
+        #    있으면 손님에게 **틀린 망**을 안내하게 된다 → 시작할 때 지금 연결된 이름으로 갱신.
+        #    비밀번호는 건드리지 않는다(저장된 자격증명을 자동으로 꺼내 보여주지 않는다).
+        if self.wifi_mode_box.currentIndex() == 1:
+            QTimer.singleShot(0, self._autofill_wifi)
 
         # ── 손님 받기 페이지(브랜딩) ──
         self.page_bg = QLineEdit(cfg.get("page_bg_color", "#0B0E13"))
@@ -791,7 +899,7 @@ class SetupWindow(QWidget):
             return "켜짐" if b else "꺼짐"
         try:
             r = self._info_rows
-            r["layout"].setText(self.layout_box.currentText())
+            r["layout"].setText(self.layout_box.currentData() or self.layout_box.currentText())
             r["res"].setText(self.res_box.currentText().split(" (")[0])
             r["quality"].setText(self.quality_box.currentText().split(" (")[0])
             r["tone"].setText(self.tone_box.currentText())
@@ -825,12 +933,63 @@ class SetupWindow(QWidget):
         except Exception:  # noqa: BLE001
             pass
 
+    def set_camera_error(self, msg: str):
+        """카메라가 왜 안 붙는지 화면에 그대로 띄운다.
+
+        ⚠️ 예전엔 실패해도 "카메라를 자동 연결하고 있어요…"만 계속 떠서, 실제로 원인을
+        찾는 데 오래 걸렸다(다른 프로그램이 장치를 물고 있던 경우). 조용한 실패 금지.
+        """
+        if not msg:
+            return
+        self.preview.setPixmap(QPixmap())        # 옛 프레임이 남아 정상처럼 보이지 않게
+        self.preview.setText("⚠ " + msg)
+        self.preview.setStyleSheet(
+            f"background:#2A1A12; border:1px solid #7A4A2E; border-radius:12px;"
+            f"color:#FFD98A; font-size:17px; font-weight:600; padding:14px;")
+        self.cam_status.setText("● 연결 실패")
+        self.cam_status.setStyleSheet("color:#FFD98A; font-size:15px; font-weight:700;")
+
+    def set_guest_addr(self, url: str, kind: str):
+        """손님이 접속할 주소를 요약표에 보여준다(자동 판정 결과).
+
+        ⚠️ 폰은 유선을 못 꽂는다 — 후보가 유선뿐이면 주소를 띄우는 것보다 **핫스팟을 켜라고
+        말해 주는 편**이 맞다. 그 상태로 QR을 나눠주면 손님은 열 수 없다.
+        """
+        row = self._info_rows.get("guestaddr")
+        if row is None:
+            return
+        ip = url.replace("http://", "").rstrip("/")
+        # 운영 정책(오너 2026-08-09): **유선이든 WiFi든 핫스팟을 켜는 것이 기본.**
+        # 장소 WiFi 는 비밀번호·게스트망 격리 때문에 손님이 못 붙는 일이 잦다.
+        warn = kind != "핫스팟"
+        if kind == "없음":
+            row.setText("연결 없음 · 핫스팟/공유기 필요")
+        elif kind == "유선":
+            row.setText("유선뿐 · 핫스팟을 켜세요")      # 폰은 유선을 못 꽂는다
+        elif kind == "WiFi":
+            row.setText(f"{ip} · WiFi(핫스팟 권장)")
+        else:
+            row.setText(f"{ip} · {kind}")
+        row.setStyleSheet(
+            f"color:{'#FFD98A' if warn else TEXT}; font-size:15px; font-weight:600;")
+        row.setToolTip("\n".join([
+            "권장: 이 PC의 모바일 핫스팟을 켜고 손님을 거기 붙입니다.",
+            "  장소 WiFi 는 비밀번호·게스트망 격리 때문에 손님이 못 붙는 일이 잦습니다.",
+            "· 유선/WiFi 로 인터넷이 있으면 핫스팟이 켜집니다(그 연결을 공유).",
+            "· 인터넷이 하나도 없으면 이 PC 핫스팟은 켜지지 않습니다.",
+            "  → 인터넷 회선이 없는 빈 공유기라도 좋으니 PC·손님을 같은 공유기에 붙이세요.",
+            "  → 또는 운영자 폰 핫스팟에 PC·손님을 함께 연결(기기 간 통신 차단 여부 확인).",
+            "※ 부스 시작 전 폰으로 QR 을 한 번 찍어 실접속을 확인하세요.",
+        ]) if warn else "손님이 이 핫스팟에 붙어 사진을 받습니다.")
+
     def _on_camera_changed(self, *_):
         if not self._suppress_reconnect:
             self.test_camera_requested.emit()  # 카메라 선택 바뀌면 자동 재연결
 
     def _sync_hint(self):
-        self.hint2.setText(f"‘{self.trigger_key}’ 키 또는 ‘촬영 시작’으로 시작")
+        # F3 안내는 필수 — 화면이 반대 모니터에 떴을 때 이 문구가 없으면 손쓸 방법을 모른다
+        self.hint2.setText(
+            f"‘{self.trigger_key}’ 키 또는 ‘촬영 시작’으로 시작   ·   F3 모니터 바꾸기   ·   F2 손님 화면")
 
     def showEvent(self, e):
         self._ready_at = time.monotonic() + 0.6
@@ -852,12 +1011,54 @@ class SetupWindow(QWidget):
                 if time.monotonic() >= self._ready_at:
                     self.start_requested.emit()
                 return True
+            if ev.key() in (Qt.Key_Left, Qt.Key_Right) and self._arrows_free():
+                if self._step_user_layout(-1 if ev.key() == Qt.Key_Left else 1):
+                    return True
         return super().eventFilter(obj, ev)
+
+    def _arrows_free(self, focused=None):
+        """좌우 방향키를 레이아웃 전환에 써도 되는 상황인가.
+
+        ⚠️ 같은 키가 이미 **슬롯 미세이동**(칸 선택 후 1px/Shift 10px)과 텍스트 입력에 쓰인다.
+        그쪽이 먼저다 — 칸을 고른 채 편집 중이거나 입력칸에 커서가 있으면 손대지 않는다.
+        """
+        from PyQt5.QtWidgets import QLineEdit, QSpinBox, QComboBox, QAbstractSpinBox
+        if self.editor.sel is not None:
+            return False        # 칸을 고른 상태 = 미세이동 중(빈 곳을 클릭해 선택을 풀면 전환된다)
+        w = focused if focused is not None else QApplication.focusWidget()
+        return not isinstance(w, (QLineEdit, QSpinBox, QAbstractSpinBox, QComboBox))
+
+    def _step_user_layout(self, d):
+        """좌우 방향키 — **내가 등록한 레이아웃만** 순환한다(예시는 건너뛴다).
+
+        현장에서 쓰는 건 자기가 만든 디자인이지 예시가 아니다. 예시가 사이에 끼면
+        손님 앞에서 엉뚱한 화면이 뜬다. 등록한 레이아웃이 없으면 아무 일도 하지 않는다.
+        """
+        names = [u["name"] for u in self.user_layouts]
+        if not names:
+            return False
+        cur = getattr(self, "_active_layout", None)
+        if cur in names:
+            nxt = names[(names.index(cur) + d) % len(names)]
+        else:                                 # 지금이 예시면 바로 내 레이아웃으로 들어간다
+            nxt = names[0 if d > 0 else -1]
+        idx = self.layout_box.findData(nxt)
+        if idx < 0:
+            return False
+        self.layout_box.setCurrentIndex(idx)  # 시그널 → _select_layout 이 통째로 교체
+        return True
 
     def show_preview_frame(self, qimage):
         self._last_frame = qimage          # 결과 미리보기에 실제 카메라 화면 사용
+        if not self.isVisible():
+            return                         # 촬영 중엔 설정 화면이 숨겨져 있다 — 스케일 낭비 금지
         pm = QPixmap.fromImage(qimage)
-        self.preview.setPixmap(pm.scaled(self.preview.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        if self.preview.text():            # 실패 안내가 떠 있었다면 원래 모습으로 되돌린다
+            self.preview.setText("")
+            self.preview.setStyleSheet(
+                f"background:#05070b; border:1px solid {LINE}; border-radius:12px;"
+                f"color:{MUTED}; font-size:16px;")
+        self.preview.setPixmap(pm.scaled(self.preview.size(), Qt.KeepAspectRatio, Qt.FastTransformation))
         self.cam_status.setText("● 연결됨")
         self.cam_status.setStyleSheet(f"color:{OK_GREEN}; font-size:15px; font-weight:700;")
 
@@ -938,30 +1139,271 @@ class SetupWindow(QWidget):
         }
         cfg["slots"] = self.editor.get_slots()
         cfg["canvas_size"] = [self.editor.canvas_w, self.editor.canvas_h]
+        cfg["even_layout"] = self.editor.even
+        cfg["user_layouts"] = [dict(u) for u in self.user_layouts]      # 사용자 레이아웃 라이브러리
+        # 활성 이름은 **실제로 그 배치를 쓰고 있을 때만** 저장한다(빈 값 = 자유 편집 상태).
+        cfg["active_layout"] = getattr(self, "_active_layout", "") or ""
         return cfg
 
-    @staticmethod
-    def _match_layout(canvas, slots):
-        """저장된 캔버스·슬롯과 정확히 일치하는 프리셋 이름. 없으면 '사용자 지정'."""
+    # ── 레이아웃 라이브러리(예시 + 사용자 자체 템플릿) ──────────────────
+    def _builtin_entries(self):
         from core.layouts import LAYOUTS
-        key = (list(canvas), [(s.get("x"), s.get("y"), s.get("w"), s.get("h")) for s in slots])
-        for name, lay in LAYOUTS.items():
-            cand = (list(lay["canvas_size"]),
-                    [(s["x"], s["y"], s["w"], s["h"]) for s in lay["slots"]])
-            if cand == key:
-                return name
-        return "사용자 지정"
+        return [{"name": name, "builtin": True, "template_path": "",
+                 "canvas_size": list(lay["canvas_size"]),
+                 "slots": [dict(s) for s in lay["slots"]], "even": False}
+                for name, lay in LAYOUTS.items()]
 
-    def _apply_layout(self, name):
-        from core.layouts import LAYOUTS
-        lay = LAYOUTS.get(name)
-        if not lay:
+    def _all_entries(self):
+        return self._builtin_entries() + self.user_layouts
+
+    def _find_entry(self, name):
+        for e in self._all_entries():
+            if e["name"] == name:
+                return e
+        return None
+
+    def _match_entry(self, canvas, slots, template):
+        """현재 상태와 일치하는 레이아웃 이름. 없으면 None."""
+        key = (list(canvas), [(s.get("x"), s.get("y"), s.get("w"), s.get("h")) for s in slots],
+               (template or ""))
+        for e in self._all_entries():
+            cand = (list(e["canvas_size"]),
+                    [(s["x"], s["y"], s["w"], s["h"]) for s in e["slots"]],
+                    (e.get("template_path") or ""))
+            if cand == key:
+                return e["name"]
+        return None
+
+    def _reload_layout_combo(self, select=None):
+        cur = select or (self.layout_box.currentData() if self.layout_box.count() else None)
+        self.layout_box.blockSignals(True)
+        self.layout_box.clear()
+        for e in self._all_entries():
+            label = ("★ " + e["name"]) if not e["builtin"] else e["name"]  # ★=사용자 레이아웃
+            self.layout_box.addItem(label, e["name"])
+        if cur:
+            i = self.layout_box.findData(cur)
+            if i >= 0:
+                self.layout_box.setCurrentIndex(i)
+        self.layout_box.blockSignals(False)
+        self._update_layout_buttons()
+
+    def _update_layout_buttons(self):
+        e = self._find_entry(self.layout_box.currentData())
+        is_user = bool(e and not e["builtin"])
+        self.rename_btn.setEnabled(is_user)     # 예시는 이름변경·삭제 불가
+        self.del_btn.setEnabled(is_user)
+
+    def _select_layout(self, name):
+        """레이아웃 전환 — 템플릿·캔버스·슬롯·균등모드를 '통째로' 교체한다.
+        (이렇게 전부 교체해야 다른 레이아웃으로 바꿀 때 자체 이미지 크기가 오염되지 않는다.)"""
+        e = self._find_entry(name)
+        if not e:
             return
-        cw, ch = lay["canvas_size"]
-        self.editor.set_canvas_size(cw, ch)
-        self.editor.slots = [dict(s) for s in lay["slots"]]
+        self._active_layout = name
+        tpath = e.get("template_path") or ""
+        self.template_edit.setText(tpath)
+        self.editor.set_template(tpath or None)
+        self.editor.set_canvas_size(*e["canvas_size"])
+        self.editor.slots = [dict(s) for s in e["slots"]]
+        self.editor.sel = None
+        self.even_btn.blockSignals(True)
+        self.even_btn.setChecked(bool(e.get("even")))
+        self.even_btn.blockSignals(False)
+        self.editor.set_even(bool(e.get("even")), normalize=False)
+        self._style_even_btn()
         self.editor.update()
+        self._update_layout_buttons()
         self._refresh_info()
+
+    def _step_layout(self, d):
+        n = self.layout_box.count()
+        if n:
+            self.layout_box.setCurrentIndex(max(0, min(self.layout_box.currentIndex() + d, n - 1)))
+
+    def _unique_layout_name(self, base):
+        base = (base or "레이아웃").strip()
+        name = base; k = 2
+        while self._find_entry(name):
+            name = f"{base} ({k})"; k += 1
+        return name
+
+    def _add_template_layout(self, path=None):
+        if not path:
+            path, _ = QFileDialog.getOpenFileName(
+                self, "템플릿 이미지 선택", "", "이미지 (*.png *.jpg *.jpeg)")
+        if not path:
+            return
+        from PyQt5.QtGui import QImage
+        img = QImage(path)
+        if img.isNull():
+            return
+        nw, nh = img.width(), img.height()
+        # 슬롯 = 현재 슬롯을 새 캔버스에 비례 변환(구멍 위치 추정)
+        ow, oh = self.editor.canvas_w, self.editor.canvas_h
+        slots = [dict(s) for s in self.editor.slots]
+        # ① 템플릿의 '사진 자리'(투명 구멍/초록 칠)를 그대로 읽는다 — 손으로 맞출 필요가 없다.
+        from core.slot_detect import detect_slots
+        found = detect_slots(path, want=len(slots) or 4)
+        if found:
+            slots = found
+            ow = oh = 0                      # 아래 비례 변환 건너뜀(이미 실제 좌표다)
+        elif ow and oh and (nw, nh) != (ow, oh):
+            # ② 구멍을 못 찾으면 **캔버스 비율에 맞는 예시 배치**를 초기값으로(오너 제공 규격).
+            from core.layouts import LAYOUTS
+            want_r = nw / nh
+            best = min(LAYOUTS.values(),
+                       key=lambda L: abs(L["canvas_size"][0] / L["canvas_size"][1] - want_r))
+            if abs(best["canvas_size"][0] / best["canvas_size"][1] - want_r) < 0.02:
+                k = nw / best["canvas_size"][0]
+                slots = [{"x": int(round(s["x"] * k)), "y": int(round(s["y"] * k)),
+                          "w": int(round(s["w"] * k)), "h": int(round(s["h"] * k))}
+                         for s in best["slots"]]
+                ow = oh = 0
+        if ow and oh and (nw, nh) != (ow, oh):
+            # ⚠️ **칸 크기는 가로·세로를 따로 늘리면 안 된다.** 캔버스 비율이 다른 템플릿을
+            #    넣으면 칸이 찌그러진다 — 실측: 1200×1800(칸 518×345=1.50)에서 640×1920 템플릿을
+            #    추가했더니 276×368 = 0.75(세로)가 되어 "사진 비율이 계속 달라짐"으로 나타났다.
+            #    위치는 비례로 옮기되 **크기는 한 배율(작은 쪽)** 로만 줄인다 → 칸 비율 보존.
+            sx, sy = nw / ow, nh / oh
+            k = min(sx, sy)
+            for s in slots:
+                s["w"] = max(1, int(round(s["w"] * k)))
+                s["h"] = max(1, int(round(s["h"] * k)))
+                s["x"] = max(0, min(int(round(s["x"] * sx)), nw - s["w"]))
+                s["y"] = max(0, min(int(round(s["y"] * sy)), nh - s["h"]))
+        name = self._unique_layout_name(os.path.splitext(os.path.basename(path))[0])
+        self.user_layouts.append({"name": name, "builtin": False, "template_path": path,
+                                  "canvas_size": [nw, nh], "slots": slots,
+                                  "even": self.editor.even})
+        self._reload_layout_combo(select=name)
+        self._select_layout(name)
+
+    def _rename_layout(self):
+        e = self._find_entry(self.layout_box.currentData())
+        if not e or e["builtin"]:
+            return
+        from PyQt5.QtWidgets import QInputDialog
+        new, ok = QInputDialog.getText(self, "레이아웃 이름 변경", "새 이름:", text=e["name"])
+        new = (new or "").strip()
+        if ok and new and new != e["name"] and not self._find_entry(new):
+            e["name"] = new
+            self._reload_layout_combo(select=new)
+            self._refresh_info()
+
+    def _delete_layout(self):
+        name = self.layout_box.currentData()
+        e = self._find_entry(name)
+        if not e or e["builtin"]:
+            return
+        self.user_layouts = [u for u in self.user_layouts if u["name"] != name]
+        self._reload_layout_combo()
+        self._select_layout(self.layout_box.currentData())
+
+    def _style_even_btn(self):
+        """균등 배치 ON/OFF 시각 표시 — ON=코발트 강조, OFF=회색."""
+        on = self.even_btn.isChecked()
+        self.even_btn.setText("  균등 ON" if on else "  균등 OFF")
+        self.even_btn.setIcon(icons.icon("layout-grid", "#FFFFFF" if on else MUTED, 17))
+        if on:
+            self.even_btn.setStyleSheet(
+                f"QPushButton{{background:{ACCENT}; color:#FFFFFF; border:1px solid {ACCENT};"
+                f"border-radius:8px; padding:6px 12px; font-weight:700;}}")
+        else:
+            self.even_btn.setStyleSheet(
+                f"QPushButton{{background:transparent; color:{MUTED}; border:1px solid {LINE};"
+                f"border-radius:8px; padding:6px 12px;}}")
+
+    def _toggle_even(self, on):
+        """균등 배치 온/오프. 켜면 즉시 같은 크기·간격으로 정렬하고 격자로 묶는다."""
+        self.editor.set_even(on, normalize=True)
+        self._style_even_btn()
+        self._on_slots_edited()
+
+    def _on_slots_edited(self):
+        """드래그·방향키·균등배치로 슬롯이 바뀌면 **지금 편집 중인 레이아웃에만** 반영.
+
+        ⚠️ 활성 레이아웃의 출처는 `self._active_layout` 하나로 통일한다. 예전엔 콤보의
+        currentData() 를 읽었는데, 콤보를 거치지 않고 레이아웃을 바꾸는 경로가 있어
+        **다른 레이아웃 항목에 편집이 저장되는** 사고가 났다(실측 재현: 2번을 옮겼는데 1번이 바뀜).
+
+        예시(빌트인)를 편집하면 저장할 곳이 없어 전환하는 순간 조용히 사라졌다 →
+        **첫 편집에서 사용자 레이아웃 사본으로 승격**해 원본 예시는 보존하고 편집은 살린다.
+        """
+        name = getattr(self, "_active_layout", None) or self.layout_box.currentData()
+        e = self._find_entry(name)
+        if e is None:
+            self._refresh_info(); return
+        if e["builtin"]:
+            e = self._promote_builtin(e)
+            if e is None:
+                self._refresh_info(); return
+        e["slots"] = self.editor.get_slots()
+        e["canvas_size"] = [self.editor.canvas_w, self.editor.canvas_h]
+        e["even"] = self.editor.even
+        self._refresh_info()
+
+    def layout_preview_pixmap(self, entry=None):
+        """레이아웃 미리보기 그림 — 템플릿 이미지가 있으면 그것, 없으면 칸 배치를 그린다.
+        (손님 화면에서도 같은 그림을 쓰므로 여기 하나만 둔다.)"""
+        from PyQt5.QtGui import QPixmap, QPainter, QColor
+        e = entry if entry is not None else self._find_entry(getattr(self, "_active_layout", None))
+        tp = (e or {}).get("template_path") or ""
+        if tp:
+            pm = QPixmap(tp)
+            if not pm.isNull():
+                return pm
+        cw, ch = (e or {}).get("canvas_size") or [self.editor.canvas_w, self.editor.canvas_h]
+        slots = (e or {}).get("slots") or self.editor.get_slots()
+        pm = QPixmap(int(cw), int(ch)); pm.fill(QColor("#FFFFFF"))
+        pt = QPainter(pm)
+        pt.setBrush(QColor("#D8DEE9")); pt.setPen(QColor(ACCENT))
+        for s in slots:
+            pt.drawRect(int(s["x"]), int(s["y"]), int(s["w"]), int(s["h"]))
+        pt.end()
+        return pm
+
+    def _promote_builtin(self, entry):
+        """예시를 편집하면 사용자 레이아웃 사본을 만들어 그쪽으로 옮긴다(예시 원본은 그대로)."""
+        name = self._unique_layout_name(f"{entry['name']} 수정본")
+        copy = {"name": name, "builtin": False,
+                "template_path": entry.get("template_path") or self.template_edit.text().strip(),
+                "canvas_size": [self.editor.canvas_w, self.editor.canvas_h],
+                "slots": self.editor.get_slots(), "even": self.editor.even}
+        self.user_layouts.append(copy)
+        self._active_layout = name
+        self._reload_layout_combo(select=name)
+        self._update_layout_buttons()
+        return copy
+
+    def _detect_slots_now(self):
+        """지금 레이아웃의 템플릿에서 사진 자리를 다시 읽어 칸을 맞춘다.
+
+        ⚠️ 못 찾으면 **아무것도 바꾸지 않고** 이유를 알려준다 — 조용히 엉뚱한 칸을 넣으면
+        손님 사진이 잘린 채로 나간다.
+        """
+        from PyQt5.QtWidgets import QMessageBox
+        from core.slot_detect import detect_slots
+        path = (self.template_edit.text() or "").strip()
+        if not path:
+            QMessageBox.information(self, "칸 자동 인식",
+                                    "이 레이아웃에는 템플릿 이미지가 없습니다.\n"
+                                    "‘이미지 추가’로 템플릿을 넣은 뒤 다시 시도하세요.")
+            return
+        found = detect_slots(path, want=len(self.editor.slots) or 4)
+        if not found:
+            QMessageBox.information(self, "칸 자동 인식",
+                                    "사진 자리를 찾지 못했습니다.\n"
+                                    "템플릿의 사진 자리가 투명하게 뚫려 있거나 초록으로 칠해져 있어야 합니다.")
+            return
+        self.editor.slots = [dict(s) for s in found]
+        self.editor.sel = None
+        self.editor.update()
+        self._on_slots_edited()
+        s = found[0]
+        QMessageBox.information(self, "칸 자동 인식",
+                                f"사진 자리 {len(found)}개를 찾았습니다.\n"
+                                f"칸 {s['w']}×{s['h']} (비율 {s['w']/s['h']:.2f})")
 
     def _export_examples(self):
         from core.layouts import export_all_examples
@@ -979,13 +1421,25 @@ class SetupWindow(QWidget):
         from PyQt5.QtGui import QImage
         img = QImage(path)
         if not img.isNull():
-            self.editor.set_canvas_size(img.width(), img.height())
+            nw, nh = img.width(), img.height()
+            ow, oh = self.editor.canvas_w, self.editor.canvas_h
+            # ⚠️ 핵심: 템플릿을 적용하면 캔버스 좌표계가 '템플릿 픽셀 크기'로 바뀐다.
+            #    이때 슬롯을 함께 비례 변환하지 않으면, 다른 크기로 만든 템플릿에서 슬롯이
+            #    프레임을 벗어나거나(폭 초과) 캔버스 밖으로 나가(아래 컷 소실) 합성이 깨진다.
+            #    (실측: 1920×2224 좌표의 슬롯 + 864×1001 템플릿 → 아래 2컷이 캔버스 밖)
+            if ow and oh and (nw, nh) != (ow, oh):
+                sx, sy = nw / ow, nh / oh
+                for sl in self.editor.slots:
+                    sl["x"] = int(round(sl["x"] * sx)); sl["y"] = int(round(sl["y"] * sy))
+                    sl["w"] = int(round(sl["w"] * sx)); sl["h"] = int(round(sl["h"] * sy))
+            self.editor.set_canvas_size(nw, nh)
+            self.editor.update()
+            self._refresh_info()
         self.editor.set_template(path)
 
     def _pick_template(self):
-        p, _ = QFileDialog.getOpenFileName(self, "템플릿 PNG 선택", "", "PNG (*.png)")
-        if p:
-            self.template_edit.setText(p); self._apply_template(p)
+        # 자체 템플릿을 고르면 새 '사용자 레이아웃'으로 추가(레이아웃별 이미지 관리)
+        self._add_template_layout()
 
     def _pick_save(self):
         p = QFileDialog.getExistingDirectory(self, "저장 폴더 선택")
@@ -1163,9 +1617,31 @@ class SetupWindow(QWidget):
             self._autofill_hotspot()
 
     def _autofill_wifi(self):
-        """지금 PC가 연결된 WiFi 이름(SSID)을 netsh로 자동 입력(Windows)."""
+        """지금 PC가 연결된 WiFi 이름(SSID)을 자동 입력(Windows).
+
+        ⚠️ `netsh wlan show interfaces` 는 **위치 권한이 꺼져 있으면 SSID 를 주지 않는다**
+        (Windows 11: "WLAN 정보에 액세스하려면 위치 권한이 필요합니다"). 실측으로 확인했고,
+        조용히 실패하면 **지난 장소의 WiFi 이름이 그대로 남아 손님에게 틀린 망을 안내한다.**
+        그래서 위치 권한이 필요 없는 연결 프로필 경로를 먼저 쓰고, netsh 는 보조로만 쓴다.
+        """
+        import subprocess
+        ps = ("$ErrorActionPreference='SilentlyContinue';"
+              "Get-NetConnectionProfile | Where-Object {"
+              "(Get-NetAdapter -InterfaceIndex $_.InterfaceIndex).InterfaceType -eq 71 }"
+              " | Select-Object -First 1 -ExpandProperty Name")
         try:
-            import subprocess, re
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                capture_output=True, encoding="utf-8", errors="replace",
+                creationflags=0x08000000, timeout=8).stdout or ""
+            ssid = out.strip().splitlines()[0].strip() if out.strip() else ""
+            if ssid:
+                self.wifi_ssid.setText(ssid)
+                return
+        except Exception:  # noqa: BLE001
+            pass
+        try:                                   # 보조: 위치 권한이 켜져 있으면 이쪽도 된다
+            import re
             out = subprocess.run(["netsh", "wlan", "show", "interfaces"],
                                  capture_output=True, encoding="utf-8", errors="replace",
                                  creationflags=0x08000000, timeout=6).stdout or ""
